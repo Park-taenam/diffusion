@@ -215,4 +215,4 @@ img_processor = VaeImageProcessor()
 final_image = img_processor.postprocess(image)
 final_image[0]
 
-# %% Text-guided image-inpainting
+# %%
