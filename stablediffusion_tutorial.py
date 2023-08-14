@@ -1,12 +1,117 @@
-# %% Basic Stable Diffusion pipeline
-from diffusers import StableDiffusionPipeline
+# print(os.getcwd())
+# os.chdir("./workspace") # Lab
+# print(os.getcwd())
+# image.save("/images/image_of_squirrel_painting.png")
+
+# %% Simple Inference(Basic Stable Diffusion pipeline)
+from diffusers import DiffusionPipeline, StableDiffusionPipeline, EulerDiscreteScheduler
 import torch
 
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
-pipe = pipe.to("cuda")
+pipeline = DiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
+pipeline.scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config) # Swapping schedulers
+pipeline.to("cuda")
 prompt = "a photo of an astronaut riding a horse on mars"
-image = pipe(prompt).images[0]
+prompt = "An image of a squirrel in Picasso style"
+image = pipeline(prompt).images[0]
 image
+
+# %% Effective and Efficient diffusion - Speed
+# 1. Using GPU
+from diffusers import DiffusionPipeline
+import torch
+
+model_id = "runwayml/stable-diffusion-v1-5"
+pipeline = DiffusionPipeline.from_pretrained(model_id)
+
+prompt = "portrait photo of a old warrior chief"
+pipeline = pipeline.to("cuda")
+
+generator = torch.Generator("cuda").manual_seed(0)
+
+image = pipeline(prompt, generator=generator).images[0]
+image
+
+# 2. float32 -> float16 (speed up) (10s -> 3s)
+# 항상 float16 사용하는 거 추천! 지금까지 output에서 성능 저하 발견 못함
+import torch
+
+pipeline = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+pipeline = pipeline.to("cuda")
+generator = torch.Generator("cuda").manual_seed(0)
+image = pipeline(prompt, generator=generator).images[0]
+image
+
+# 3. to reduce the number of inference steps
+# compatibles method: DiffusionPipeline에서 현재 모델과 호환되는 스케줄러를 찾을 수 있음
+print(pipeline.scheduler.compatibles)
+
+# 4. Scheduler
+# StableDiffusion model은 PNDMScheduler를 Default로 사용함 (50 inferfence steps)
+# DPMSolverMultistepScheduler : 20 or 25 inference steps -> 1s
+from diffusers import DPMSolverMultistepScheduler
+
+pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+
+generator = torch.Generator("cuda").manual_seed(0)
+image = pipeline(prompt, generator=generator, num_inference_steps=20).images[0]
+image
+
+
+# %% Effective and Efficient diffusion - Memory
+# 1. batch size 조정
+def get_inputs(batch_size=1):
+    generator = [torch.Generator("cuda").manual_seed(i) for i in range(batch_size)]
+    prompts = batch_size * [prompt]
+    num_inference_steps = 20
+
+    return {"prompt": prompts, "generator": generator, "num_inference_steps": num_inference_steps}
+
+from PIL import Image
+
+def image_grid(imgs, rows=2, cols=2):
+    w, h = imgs[0].size
+    grid = Image.new("RGB", size=(cols * w, rows * h))
+
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=(i % cols * w, i // cols * h))
+    return grid
+
+images = pipeline(**get_inputs(batch_size=4)).images
+image_grid(images)
+
+# 2. attention slicing : 순차적으로 수행하면 메모리 아낄 수 있음 -> OOM 방지 가능
+pipeline.enable_attention_slicing()
+images = pipeline(**get_inputs(batch_size=8)).images
+image_grid(images, rows=2, cols=4)
+
+# %% Effective and Efficient diffusion - Quality
+# 1. Better checkpoints
+# try loading the latest autodecoder from Stability AI into the pipeline
+from diffusers import AutoencoderKL
+
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16).to("cuda")
+pipeline.vae = vae
+images = pipeline(**get_inputs(batch_size=8)).images
+image_grid(images, rows=2, cols=4)
+
+# 2. Better prompt engineering
+# improve the prompt to include color and higher quality details
+prompt += ", tribal panther make up, blue on red, side profile, looking away, serious eyes"
+prompt += " 50mm portrait photography, hard rim lighting photography--beta --ar 2:3  --beta --upbeta"
+
+images = pipeline(**get_inputs(batch_size=8)).images
+image_grid(images, rows=2, cols=4)
+
+prompts = [
+    "portrait photo of the oldest warrior chief, tribal panther make up, blue on red, side profile, looking away, serious eyes 50mm portrait photography, hard rim lighting photography--beta --ar 2:3  --beta --upbeta",
+    "portrait photo of a old warrior chief, tribal panther make up, blue on red, side profile, looking away, serious eyes 50mm portrait photography, hard rim lighting photography--beta --ar 2:3  --beta --upbeta",
+    "portrait photo of a warrior chief, tribal panther make up, blue on red, side profile, looking away, serious eyes 50mm portrait photography, hard rim lighting photography--beta --ar 2:3  --beta --upbeta",
+    "portrait photo of a young warrior chief, tribal panther make up, blue on red, side profile, looking away, serious eyes 50mm portrait photography, hard rim lighting photography--beta --ar 2:3  --beta --upbeta",
+]
+
+generator = [torch.Generator("cuda").manual_seed(1) for _ in range(len(prompts))]
+images = pipeline(prompt=prompts, generator=generator, num_inference_steps=25).images
+image_grid(images)
 
 # %% Deconstruct the Stable Diffusion pipeline
 # (1) from pretrained - vae, tokenizer, text_encoder, unet, scheduler
@@ -16,6 +121,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 from diffusers import UniPCMultistepScheduler
 
+# VAE, UNet, text encoder models
 vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="vae") # 83,653,863 params
 tokenizer = CLIPTokenizer.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="tokenizer") # tokenizer이므로 학습 파라미터 없음
 text_encoder = CLIPTextModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="text_encoder") # 123,060,480 params
@@ -42,22 +148,23 @@ batch_size = len(prompt)
 # (4) Create text embeddings
 # 만약 하나의 prompt에 대해 여러 이미지를 생성하고 싶으면 .to(), .repeat(), .view() 등 추가해야 함. 
 # -> pipeline_stable_diffusion.py 참고
+# text_embeddings: 입력 문장 임베딩 (prompt embedding)
+# uncond_embeddings: ""이면 null이라 uncond이고, 만약 uncond_input에 뭔가 적으면 negative prompt embedding인 것.
 text_input = tokenizer(
     prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
 ) # {'input_ids', 'attention_mask'}. text_input.input_ids = torch.Size([1, 77])
 with torch.no_grad():
     text_embeddings = text_encoder(text_input.input_ids.to(torch_device))[0] # torch.Size([1, 77, 768])
 
+#  unconditional text embeddings
 max_length = text_input.input_ids.shape[-1] # tokenizer.model_max_length (=77)
 uncond_input = tokenizer([""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt") # {'input_ids', 'attention_mask'}. text_input.input_ids = torch.Size([1, 77])
 uncond_embeddings = text_encoder(uncond_input.input_ids.to(torch_device))[0] # torch.Size([1, 77, 768])
+
 text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # torch.Size([2, 77, 768]) # forward pass 두 번 하지 않도록
 
-# text_embeddings: 입력 문장 임베딩 (prompt embedding)
-# uncond_embeddings: ""이면 null이라 uncond이고, 만약 uncond_input에 뭔가 적으면 negative prompt embedding인 것.
-
 ## Create random noise
-# (5) Create Gaussian noise
+# (5) Create Gaussian noise (a starting point for the diffusion process)
 # vae model이 3개의 down-sampling layers 가지고 있으므로 8로 나눔
 latents = torch.randn(
     (batch_size, unet.config.in_channels, height // 8, width // 8),
@@ -67,32 +174,11 @@ latents = latents.to(torch_device) # torch.Size([1, 4, 64, 64])
 
 ## Denoise the image
 # (6) Denoise the image
-
-##### Algorithm
-# latents ~ N(0, I) (5번 과정)
-# for t=999, 959, ..., 40 do
-# -> latents batch를 두 배로 복사.
-# -> 복사된 latents를 unet에 태워서 noise_pred 뽑음. 이때 [uncond_embeddings, text_embeddings]의
-#    형태로 encoder_hidden_states가 들어가므로 이 순서대로 text 정보가 latents 계산에 반영됨.
-# -> CFG를 위해 noise_pred를 noise_pred_uncond, noise_pred_text로 나누고 CFG 식을 통해 
-#    두 predicted noise가 하나의 noise_pred로 계산됨.
-# -> noise_pred, timestep t, 기존 latents를 이용해 (t-1)의 latents를 계산.
-# end for
-# return latents
-#####
-
-# 위 과정을 scheduler.timesteps에 대해 반복하여 z_0까지 계산.
-
-# cf)
-# 1. 즉 positive prompt와 negative(null일 경우엔 unconditional) prompt에 대한 노이즈 예측이 각각 이루어짐.
-# 2. 노이즈 예측은 각각 이루어지지만 각 t에 대해 unet의 input으로 들어가는 latents는 두 predicted noise를
-#    결합한 noise_pred로부터 만들어짐.
+latents = latents * scheduler.init_noise_sigma # scheduler.init_noise_sigma = 1
 
 from tqdm.auto import tqdm
 
-latents = latents * scheduler.init_noise_sigma # scheduler.init_noise_sigma = 1
 scheduler.set_timesteps(num_inference_steps)
-
 for t in tqdm(scheduler.timesteps):
     # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
     latent_model_input = torch.cat([latents] * 2)
@@ -128,5 +214,5 @@ pil_images[0]
 img_processor = VaeImageProcessor()
 final_image = img_processor.postprocess(image)
 final_image[0]
-# %% Text-guided image-inpainting
 
+# %% Text-guided image-inpainting
